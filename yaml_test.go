@@ -1,14 +1,176 @@
+/*
+Copyright 2021 The KhulnaSoft Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package yaml
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
 	"reflect"
-	"runtime"
+	"sort"
 	"strconv"
-	"strings"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	yamlv2 "go.khulnasoft.com/yaml/goyaml.v2"
+	yamlv3 "go.khulnasoft.com/yaml/goyaml.v3"
 )
+
+/* Test helper functions */
+
+func strPtr(str string) *string {
+	return &str
+}
+
+type errorType int
+
+const (
+	noErrorsType    errorType = 0
+	fatalErrorsType errorType = 1 << iota
+)
+
+type unmarshalTestCase struct {
+	encoded    []byte
+	decodeInto interface{}
+	decoded    interface{}
+	err        errorType
+}
+
+type testUnmarshalFunc = func(yamlBytes []byte, obj interface{}) error
+
+var (
+	funcUnmarshal testUnmarshalFunc = func(yamlBytes []byte, obj interface{}) error {
+		return Unmarshal(yamlBytes, obj)
+	}
+
+	funcUnmarshalStrict testUnmarshalFunc = func(yamlBytes []byte, obj interface{}) error {
+		return UnmarshalStrict(yamlBytes, obj)
+	}
+)
+
+func testUnmarshal(t *testing.T, f testUnmarshalFunc, tests map[string]unmarshalTestCase) {
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			typ := reflect.TypeOf(test.decodeInto)
+			if typ.Kind() != reflect.Ptr {
+				t.Errorf("unmarshalTest.ptr %T is not a pointer type", test.decodeInto)
+			}
+
+			value := reflect.New(typ.Elem())
+
+			if !reflect.DeepEqual(test.decodeInto, value.Interface()) {
+				// There's no reason for ptr to point to non-zero data,
+				// as we decode into new(right-type), so the data is
+				// discarded.
+				// This can easily mean tests that silently don't test
+				// what they should. To test decoding into existing
+				// data, see TestPrefilled.
+				t.Errorf("unmarshalTest.ptr %#v is not a pointer to a zero value", test.decodeInto)
+			}
+
+			err := f(test.encoded, value.Interface())
+			if err != nil && test.err == noErrorsType {
+				t.Errorf("error unmarshaling YAML: %v", err)
+			}
+			if err == nil && test.err&fatalErrorsType != 0 {
+				t.Errorf("expected a fatal error, but no fatal error was returned, yaml: `%s`", test.encoded)
+			}
+
+			if test.err&fatalErrorsType != 0 {
+				// Don't check output if error is fatal
+				return
+			}
+
+			if !reflect.DeepEqual(value.Elem().Interface(), test.decoded) {
+				t.Errorf("unmarshal YAML was unsuccessful, expected: %+#v, got: %+#v", test.decoded, value.Elem().Interface())
+			}
+		})
+	}
+}
+
+type yamlToJSONTestcase struct {
+	yaml string
+	json string
+	// By default we test that reversing the output == input. But if there is a
+	// difference in the reversed output, you can optionally specify it here.
+	yamlReverseOverwrite *string
+	err                  errorType
+}
+
+type testYAMLToJSONFunc = func(yamlBytes []byte) ([]byte, error)
+
+var (
+	funcYAMLToJSON testYAMLToJSONFunc = func(yamlBytes []byte) ([]byte, error) {
+		return YAMLToJSON(yamlBytes)
+	}
+
+	funcYAMLToJSONStrict testYAMLToJSONFunc = func(yamlBytes []byte) ([]byte, error) {
+		return YAMLToJSONStrict(yamlBytes)
+	}
+)
+
+func testYAMLToJSON(t *testing.T, f testYAMLToJSONFunc, tests map[string]yamlToJSONTestcase) {
+	for testName, test := range tests {
+		t.Run(fmt.Sprintf("%s_YAMLToJSON", testName), func(t *testing.T) {
+			// Convert Yaml to Json
+			jsonBytes, err := f([]byte(test.yaml))
+			if err != nil && test.err == noErrorsType {
+				t.Errorf("Failed to convert YAML to JSON, yamlv2: `%s`, err: %v", test.yaml, err)
+			}
+			if err == nil && test.err&fatalErrorsType != 0 {
+				t.Errorf("expected a fatal error, but no fatal error was returned, yaml: `%s`", test.yaml)
+			}
+
+			if test.err&fatalErrorsType != 0 {
+				// Don't check output if error is fatal
+				return
+			}
+
+			// Check it against the expected output.
+			if string(jsonBytes) != test.json {
+				t.Errorf("Failed to convert YAML to JSON, yaml: `%s`, expected json `%s`, got `%s`", test.yaml, test.json, string(jsonBytes))
+			}
+		})
+
+		t.Run(fmt.Sprintf("%s_JSONToYAML", testName), func(t *testing.T) {
+			// Convert JSON to YAML
+			yamlBytes, err := JSONToYAML([]byte(test.json))
+			if err != nil {
+				t.Errorf("Failed to convert JSON to YAML, json: `%s`, err: %v", test.json, err)
+			}
+
+			// Set the string that we will compare the reversed output to.
+			correctYamlString := test.yaml
+
+			// If a special reverse string was specified, use that instead.
+			if test.yamlReverseOverwrite != nil {
+				correctYamlString = *test.yamlReverseOverwrite
+			}
+
+			// Check it against the expected output.
+			if string(yamlBytes) != correctYamlString {
+				t.Errorf("Failed to convert JSON to YAML, json: `%s`, expected yaml `%s`, got `%s`", test.json, correctYamlString, string(yamlBytes))
+			}
+		})
+	}
+}
+
+/* Start tests */
 
 type MarshalTest struct {
 	A string
@@ -21,7 +183,7 @@ type MarshalTest struct {
 func TestMarshal(t *testing.T) {
 	f32String := strconv.FormatFloat(math.MaxFloat32, 'g', -1, 32)
 	s := MarshalTest{"a", math.MaxInt64, math.MaxFloat32}
-	e := []byte(fmt.Sprintf("A: a\nB: %d\nC: %s\n", int64(math.MaxInt64), f32String))
+	e := []byte(fmt.Sprintf("A: a\nB: %d\nC: %s\n", math.MaxInt64, f32String))
 
 	y, err := Marshal(s)
 	if err != nil {
@@ -34,396 +196,794 @@ func TestMarshal(t *testing.T) {
 	}
 }
 
-type UnmarshalString struct {
+type UnmarshalUntaggedStruct struct {
 	A    string
 	True string
 }
 
+type UnmarshalTaggedStruct struct {
+	AUpper            string `json:"A"`
+	ALower            string `json:"a"`
+	TrueUpper         string `json:"True"`
+	TrueLower         string `json:"true"`
+	YesUpper          string `json:"Yes"`
+	YesLower          string `json:"yes"`
+	Int3              string `json:"3"`
+	IntBig1           string `json:"9007199254740993"` // 2^53 + 1
+	IntBig2           string `json:"1000000000000000000000000000000000000"`
+	IntBig2Scientific string `json:"1e+36"`
+	Float3dot3        string `json:"3.3"`
+}
+
+type UnmarshalStruct struct {
+	A string  `json:"a"`
+	B *string `json:"b"`
+	C string  `json:"c"`
+}
+
 type UnmarshalStringMap struct {
-	A map[string]string
+	A map[string]string `json:"a"`
 }
 
-type UnmarshalNestedString struct {
-	A NestedString
-}
-
-type NestedString struct {
-	A string
+type UnmarshalNestedStruct struct {
+	A UnmarshalStruct `json:"a"`
 }
 
 type UnmarshalSlice struct {
-	A []NestedSlice
+	A []UnmarshalStruct `json:"a"`
 }
 
-type NestedSlice struct {
-	B string
-	C *string
+type UnmarshalEmbedStruct struct {
+	UnmarshalStruct
+	B string `json:"b"`
+}
+
+type UnmarshalEmbedStructPointer struct {
+	*UnmarshalStruct
+	B string `json:"b"`
+}
+
+type UnmarshalEmbedRecursiveStruct struct {
+	*UnmarshalEmbedRecursiveStruct `json:"a"`
+	B                              string `json:"b"`
 }
 
 func TestUnmarshal(t *testing.T) {
-	y := []byte("a: 1")
-	s1 := UnmarshalString{}
-	e1 := UnmarshalString{A: "1"}
-	unmarshalEqual(t, y, &s1, &e1)
+	tests := map[string]unmarshalTestCase{
+		// casematched / non-casematched untagged keys
+		"untagged casematched string key": {
+			encoded:    []byte("A: test"),
+			decodeInto: new(UnmarshalUntaggedStruct),
+			decoded:    UnmarshalUntaggedStruct{A: "test"},
+		},
+		"untagged non-casematched string key": {
+			encoded:    []byte("a: test"),
+			decodeInto: new(UnmarshalUntaggedStruct),
+			decoded:    UnmarshalUntaggedStruct{A: "test"},
+		},
+		"untagged casematched boolean key": {
+			encoded:    []byte("True: test"),
+			decodeInto: new(UnmarshalUntaggedStruct),
+			decoded:    UnmarshalUntaggedStruct{True: "test"},
+		},
+		"untagged non-casematched boolean key": {
+			encoded:    []byte("true: test"),
+			decodeInto: new(UnmarshalUntaggedStruct),
+			decoded:    UnmarshalUntaggedStruct{True: "test"},
+		},
 
-	y = []byte("a: true")
-	s1 = UnmarshalString{}
-	e1 = UnmarshalString{A: "true"}
-	unmarshalEqual(t, y, &s1, &e1)
+		// casematched / non-casematched tagged keys
+		"tagged casematched string key": {
+			encoded:    []byte("A: test"),
+			decodeInto: new(UnmarshalTaggedStruct),
+			decoded:    UnmarshalTaggedStruct{AUpper: "test"},
+		},
+		"tagged non-casematched string key": {
+			encoded:    []byte("a: test"),
+			decodeInto: new(UnmarshalTaggedStruct),
+			decoded:    UnmarshalTaggedStruct{ALower: "test"},
+		},
+		"tagged casematched boolean key": {
+			encoded:    []byte("True: test"),
+			decodeInto: new(UnmarshalTaggedStruct),
+			decoded:    UnmarshalTaggedStruct{TrueLower: "test"},
+		},
+		"tagged non-casematched boolean key": {
+			encoded:    []byte("true: test"),
+			decodeInto: new(UnmarshalTaggedStruct),
+			decoded:    UnmarshalTaggedStruct{TrueLower: "test"},
+		},
+		"tagged casematched boolean key (yes)": {
+			encoded:    []byte("Yes: test"),
+			decodeInto: new(UnmarshalTaggedStruct),
+			decoded:    UnmarshalTaggedStruct{TrueLower: "test"},
+		},
+		"tagged non-casematched boolean key (yes)": {
+			encoded:    []byte("yes: test"),
+			decodeInto: new(UnmarshalTaggedStruct),
+			decoded:    UnmarshalTaggedStruct{TrueLower: "test"},
+		},
+		"tagged integer key": {
+			encoded:    []byte("3: test"),
+			decodeInto: new(UnmarshalTaggedStruct),
+			decoded:    UnmarshalTaggedStruct{Int3: "test"},
+		},
+		"tagged big integer key 2^53 + 1": {
+			encoded:    []byte("9007199254740993: test"),
+			decodeInto: new(UnmarshalTaggedStruct),
+			decoded:    UnmarshalTaggedStruct{IntBig1: "test"},
+		},
+		"tagged big integer key 1000000000000000000000000000000000000": {
+			encoded:    []byte("1000000000000000000000000000000000000: test"),
+			decodeInto: new(UnmarshalTaggedStruct),
+			decoded:    UnmarshalTaggedStruct{IntBig2Scientific: "test"},
+		},
+		"tagged float key": {
+			encoded:    []byte("3.3: test"),
+			decodeInto: new(UnmarshalTaggedStruct),
+			decoded:    UnmarshalTaggedStruct{Float3dot3: "test"},
+		},
 
-	y = []byte("true: 1")
-	s1 = UnmarshalString{}
-	e1 = UnmarshalString{True: "1"}
-	unmarshalEqual(t, y, &s1, &e1)
+		// decode into string field
+		"string value into string field": {
+			encoded:    []byte("a: test"),
+			decodeInto: new(UnmarshalStruct),
+			decoded:    UnmarshalStruct{A: "test"},
+		},
+		"integer value into string field": {
+			encoded:    []byte("a: 1"),
+			decodeInto: new(UnmarshalStruct),
+			decoded:    UnmarshalStruct{A: "1"},
+		},
+		"boolean value into string field": {
+			encoded:    []byte("a: true"),
+			decodeInto: new(UnmarshalStruct),
+			decoded:    UnmarshalStruct{A: "true"},
+		},
+		"boolean value (no) into string field": {
+			encoded:    []byte("a: no"),
+			decodeInto: new(UnmarshalStruct),
+			decoded:    UnmarshalStruct{A: "false"},
+		},
 
-	y = []byte("a:\n  a: 1")
-	s2 := UnmarshalNestedString{}
-	e2 := UnmarshalNestedString{NestedString{"1"}}
-	unmarshalEqual(t, y, &s2, &e2)
+		// decode into complex fields
+		"decode into nested struct": {
+			encoded:    []byte("a:\n  a: 1"),
+			decodeInto: new(UnmarshalNestedStruct),
+			decoded:    UnmarshalNestedStruct{UnmarshalStruct{A: "1"}},
+		},
+		"decode into slice": {
+			encoded:    []byte("a:\n  - a: abc\n    b: def\n  - a: 123"),
+			decodeInto: new(UnmarshalSlice),
+			decoded:    UnmarshalSlice{[]UnmarshalStruct{{A: "abc", B: strPtr("def")}, {A: "123"}}},
+		},
+		"decode into string map": {
+			encoded:    []byte("a:\n  b: 1"),
+			decodeInto: new(UnmarshalStringMap),
+			decoded:    UnmarshalStringMap{map[string]string{"b": "1"}},
+		},
+		"decode into struct pointer map": {
+			encoded:    []byte("a:\n  a: TestA\nb:\n  a: TestB\n  b: TestC"),
+			decodeInto: new(map[string]*UnmarshalStruct),
+			decoded: map[string]*UnmarshalStruct{
+				"a": {A: "TestA"},
+				"b": {A: "TestB", B: strPtr("TestC")},
+			},
+		},
 
-	y = []byte("a:\n  - b: abc\n    c: def\n  - b: 123\n    c: 456\n")
-	s3 := UnmarshalSlice{}
-	e3 := UnmarshalSlice{[]NestedSlice{NestedSlice{"abc", strPtr("def")}, NestedSlice{"123", strPtr("456")}}}
-	unmarshalEqual(t, y, &s3, &e3)
+		// decoding into string map
+		"string map: decode string key": {
+			encoded:    []byte("a:"),
+			decodeInto: new(map[string]struct{}),
+			decoded: map[string]struct{}{
+				"a": {},
+			},
+		},
+		"string map: decode boolean key": {
+			encoded:    []byte("True:"),
+			decodeInto: new(map[string]struct{}),
+			decoded: map[string]struct{}{
+				"true": {},
+			},
+		},
+		"string map: decode boolean key (yes)": {
+			encoded:    []byte("Yes:"),
+			decodeInto: new(map[string]struct{}),
+			decoded: map[string]struct{}{
+				"true": {},
+			},
+		},
+		"string map: decode integer key": {
+			encoded:    []byte("44:"),
+			decodeInto: new(map[string]struct{}),
+			decoded: map[string]struct{}{
+				"44": {},
+			},
+		},
+		"string map: decode float key": {
+			encoded:    []byte("444.444:"),
+			decodeInto: new(map[string]struct{}),
+			decoded: map[string]struct{}{
+				"444.444": {},
+			},
+		},
 
-	y = []byte("a:\n  b: 1")
-	s4 := UnmarshalStringMap{}
-	e4 := UnmarshalStringMap{map[string]string{"b": "1"}}
-	unmarshalEqual(t, y, &s4, &e4)
+		// decoding integers
+		"decode 2^53 + 1 into int": {
+			encoded:    []byte("9007199254740993"),
+			decodeInto: new(int),
+			decoded:    9007199254740993,
+		},
+		"decode 2^53 + 1 into interface": {
+			encoded:    []byte("9007199254740993"),
+			decodeInto: new(interface{}),
+			decoded:    9.007199254740992e+15,
+		},
 
-	y = []byte(`
-a:
-  name: TestA
-b:
-  name: TestB
-`)
-	type NamedThing struct {
-		Name string `json:"name"`
+		// decode into interface
+		"float into interface": {
+			encoded:    []byte("3.0"),
+			decodeInto: new(interface{}),
+			decoded:    float64(3),
+		},
+		"integer into interface": {
+			encoded:    []byte("3"),
+			decodeInto: new(interface{}),
+			decoded:    float64(3),
+		},
+		"empty vs empty string into interface": {
+			encoded:    []byte("a: \"\"\nb: \n"),
+			decodeInto: new(interface{}),
+			decoded: map[string]interface{}{
+				"a": "",
+				"b": nil,
+			},
+		},
+
+		// duplicate (non-casematched) keys (NOTE: this is very non-ideal behaviour!)
+		"decode duplicate (non-casematched) into nested struct 1": {
+			encoded:    []byte("a:\n  a: 1\n  b: 1\n  c: test\n\nA:\n  a: 2"),
+			decodeInto: new(UnmarshalNestedStruct),
+			decoded:    UnmarshalNestedStruct{A: UnmarshalStruct{A: "1", B: strPtr("1"), C: "test"}},
+		},
+		"decode duplicate (non-casematched) into nested struct 2": {
+			encoded:    []byte("A:\n  a: 1\n  b: 1\n  c: test\na:\n  a: 2"),
+			decodeInto: new(UnmarshalNestedStruct),
+			decoded:    UnmarshalNestedStruct{A: UnmarshalStruct{A: "2", B: strPtr("1"), C: "test"}},
+		},
+		"decode duplicate (non-casematched) into nested slice 1": {
+			encoded:    []byte("a:\n  - a: abc\n    b: def\nA:\n  - a: 123"),
+			decodeInto: new(UnmarshalSlice),
+			decoded:    UnmarshalSlice{[]UnmarshalStruct{{A: "abc", B: strPtr("def")}}},
+		},
+		"decode duplicate (non-casematched) into nested slice 2": {
+			encoded:    []byte("A:\n  - a: abc\n    b: def\na:\n  - a: 123"),
+			decodeInto: new(UnmarshalSlice),
+			decoded:    UnmarshalSlice{[]UnmarshalStruct{{A: "123", B: strPtr("def")}}},
+		},
+		"decode duplicate (non-casematched) into nested string map 1": {
+			encoded:    []byte("a:\n  b: 1\nA:\n  c: 1"),
+			decodeInto: new(UnmarshalStringMap),
+			decoded:    UnmarshalStringMap{map[string]string{"b": "1", "c": "1"}},
+		},
+		"decode duplicate (non-casematched) into nested string map 2": {
+			encoded:    []byte("A:\n  b: 1\na:\n  c: 1"),
+			decodeInto: new(UnmarshalStringMap),
+			decoded:    UnmarshalStringMap{map[string]string{"b": "1", "c": "1"}},
+		},
+		"decode duplicate (non-casematched) into string map": {
+			encoded:    []byte("a: test\nb: test\nA: test2"),
+			decodeInto: new(map[string]string),
+			decoded: map[string]string{
+				"a": "test",
+				"A": "test2",
+				"b": "test",
+			},
+		},
+
+		// decoding embeded structs
+		"decode embeded struct": {
+			encoded:    []byte("a: testA\nb: testB"),
+			decodeInto: new(UnmarshalEmbedStruct),
+			decoded: UnmarshalEmbedStruct{
+				UnmarshalStruct: UnmarshalStruct{
+					A: "testA",
+				},
+				B: "testB",
+			},
+		},
+		"decode embeded structpointer": {
+			encoded:    []byte("a: testA\nb: testB"),
+			decodeInto: new(UnmarshalEmbedStructPointer),
+			decoded: UnmarshalEmbedStructPointer{
+				UnmarshalStruct: &UnmarshalStruct{
+					A: "testA",
+				},
+				B: "testB",
+			},
+		},
+		"decode recursive embeded structpointer": {
+			encoded:    []byte("b: testB\na:\n  b: testA"),
+			decodeInto: new(UnmarshalEmbedRecursiveStruct),
+			decoded: UnmarshalEmbedRecursiveStruct{
+				UnmarshalEmbedRecursiveStruct: &UnmarshalEmbedRecursiveStruct{
+					B: "testA",
+				},
+				B: "testB",
+			},
+		},
+
+		// BUG: type info gets lost (#58)
+		"decode embeded struct and cast integer to string": {
+			encoded:    []byte("a: 11\nb: testB"),
+			decodeInto: new(UnmarshalEmbedStruct),
+			decoded: UnmarshalEmbedStruct{
+				UnmarshalStruct: UnmarshalStruct{
+					A: "11",
+				},
+				B: "testB",
+			},
+			err: fatalErrorsType,
+		},
+		"decode embeded structpointer and cast integer to string": {
+			encoded:    []byte("a: 11\nb: testB"),
+			decodeInto: new(UnmarshalEmbedStructPointer),
+			decoded: UnmarshalEmbedStructPointer{
+				UnmarshalStruct: &UnmarshalStruct{
+					A: "11",
+				},
+				B: "testB",
+			},
+			err: fatalErrorsType,
+		},
+
+		// decoding into incompatible type
+		"decode into stringmap with incompatible type": {
+			encoded:    []byte("a:\n  a:\n    a: 3"),
+			decodeInto: new(UnmarshalStringMap),
+			err:        fatalErrorsType,
+		},
 	}
-	s5 := map[string]*NamedThing{}
-	e5 := map[string]*NamedThing{
-		"a": &NamedThing{Name: "TestA"},
-		"b": &NamedThing{Name: "TestB"},
-	}
-	unmarshalEqual(t, y, &s5, &e5)
+
+	t.Run("Unmarshal", func(t *testing.T) {
+		testUnmarshal(t, funcUnmarshal, tests)
+	})
+
+	t.Run("UnmarshalStrict", func(t *testing.T) {
+		testUnmarshal(t, funcUnmarshalStrict, tests)
+	})
 }
 
-// TestUnmarshalNonStrict tests that we parse ambiguous YAML without error.
-func TestUnmarshalNonStrict(t *testing.T) {
-	for _, tc := range []struct {
-		yaml []byte
-		want UnmarshalString
-	}{
-		{
-			yaml: []byte("a: 1"),
-			want: UnmarshalString{A: "1"},
+func TestUnmarshalStrictFails(t *testing.T) {
+	tests := map[string]unmarshalTestCase{
+		// decoding with duplicate values
+		"decode into struct pointer map with duplicate string value": {
+			encoded:    []byte("a:\n  a: TestA\n  b: ID-A\n  b: ID-1"),
+			decodeInto: new(map[string]*UnmarshalStruct),
+			decoded: map[string]*UnmarshalStruct{
+				"a": {A: "TestA", B: strPtr("ID-1")},
+			},
 		},
-		{
-			// Unknown field get ignored.
-			yaml: []byte("a: 1\nunknownField: 2"),
-			want: UnmarshalString{A: "1"},
+		"decode into string field with duplicate boolean value": {
+			encoded:    []byte("a: true\na: false"),
+			decodeInto: new(UnmarshalStruct),
+			decoded:    UnmarshalStruct{A: "false"},
 		},
-		{
-			// Unknown fields get ignored.
-			yaml: []byte("unknownOne: 2\na: 1\nunknownTwo: 2"),
-			want: UnmarshalString{A: "1"},
+		"decode into slice with duplicate string-boolean value": {
+			encoded:    []byte("a:\n- b: abc\n  a: 32\n  b: 123"),
+			decodeInto: new(UnmarshalSlice),
+			decoded:    UnmarshalSlice{[]UnmarshalStruct{{A: "32", B: strPtr("123")}}},
 		},
-		{
-			// Last declaration of `a` wins.
-			yaml: []byte("a: 1\na: 2"),
-			want: UnmarshalString{A: "2"},
-		},
-		{
-			// Even ignore first declaration of `a` with wrong type.
-			yaml: []byte("a: [1,2,3]\na: value-of-a"),
-			want: UnmarshalString{A: "value-of-a"},
-		},
-		{
-			// Last value of `a` and first and only mention of `true` are parsed.
-			yaml: []byte("true: string-value-of-yes\na: 1\na: [1,2,3]\na: value-of-a"),
-			want: UnmarshalString{A: "value-of-a", True: "string-value-of-yes"},
-		},
-		{
-			// In YAML, `YES` is a Boolean true.
-			yaml: []byte("true: YES"),
-			want: UnmarshalString{True: "true"},
-		},
-	} {
-		s := UnmarshalString{}
-		unmarshalEqual(t, tc.yaml, &s, &tc.want)
-	}
-}
 
-// prettyFunctionName converts a slice of JSONOpt function pointers to a human
-// readable string representation.
-func prettyFunctionName(opts []JSONOpt) []string {
-	var r []string
-	for _, o := range opts {
-		r = append(r, runtime.FuncForPC(reflect.ValueOf(o).Pointer()).Name())
-	}
-	return r
-}
+		// decoding with unknown fields
+		"decode into struct with unknown field": {
+			encoded:    []byte("a: TestB\nb: ID-B\nunknown: Some-Value"),
+			decodeInto: new(UnmarshalStruct),
+			decoded:    UnmarshalStruct{A: "TestB", B: strPtr("ID-B")},
+		},
 
-func unmarshalEqual(t *testing.T, y []byte, s, e interface{}, opts ...JSONOpt) {
-	t.Helper()
-	err := Unmarshal(y, s, opts...)
-	if err != nil {
-		t.Errorf("Unmarshal(%#q, s, %v) = %v", string(y), prettyFunctionName(opts), err)
-		return
+		// decoding with duplicate complex values
+		"decode duplicate into nested struct": {
+			encoded:    []byte("a:\n  a: 1\na:\n  a: 2"),
+			decodeInto: new(UnmarshalNestedStruct),
+			decoded:    UnmarshalNestedStruct{A: UnmarshalStruct{A: "2"}},
+		},
+		"decode duplicate into nested slice": {
+			encoded:    []byte("a:\n  - a: abc\n    b: def\na:\n  - a: 123"),
+			decodeInto: new(UnmarshalSlice),
+			decoded:    UnmarshalSlice{[]UnmarshalStruct{{A: "123"}}},
+		},
+		"decode duplicate into nested string map": {
+			encoded:    []byte("a:\n  b: 1\na:\n  c: 1"),
+			decodeInto: new(UnmarshalStringMap),
+			decoded:    UnmarshalStringMap{map[string]string{"c": "1"}},
+		},
+		"decode duplicate into string map": {
+			encoded:    []byte("a: test\nb: test\na: test2"),
+			decodeInto: new(map[string]string),
+			decoded: map[string]string{
+				"a": "test2",
+				"b": "test",
+			},
+		},
 	}
 
-	if !reflect.DeepEqual(s, e) {
-		t.Errorf("Unmarshal(%#q, s, %v) = %+#v; want %+#v", string(y), prettyFunctionName(opts), s, e)
-	}
-}
+	t.Run("Unmarshal", func(t *testing.T) {
+		testUnmarshal(t, funcUnmarshal, tests)
+	})
 
-// TestUnmarshalStrict tests that we return an error on ambiguous YAML.
-func TestUnmarshalStrict(t *testing.T) {
-	for _, tc := range []struct {
-		yaml        []byte
-		want        UnmarshalString
-		wantErr     string
-	}{
-		{
-			yaml: []byte("a: 1"),
-			want: UnmarshalString{A: "1"},
-		},
-		{
-			// Order does not matter.
-			yaml: []byte("true: 1\na: 2"),
-			want: UnmarshalString{A: "2", True: "1"},
-		},
-		{
-			// By default, unknown field is ignored.
-			yaml: []byte("a: 1\nunknownField: 2"),
-			want: UnmarshalString{A: "1"},
-		},
-		{
-			// Declaring `a` twice produces an error.
-			yaml:        []byte("a: 1\na: 2"),
-			wantErr:     `key "a" already set in map`,
-		},
-		{
-			// Not ignoring first declaration of A with wrong type.
-			yaml:        []byte("a: [1,2,3]\na: value-of-a"),
-			wantErr:     `key "a" already set in map`,
-		},
-		{
-			// Declaring field `true` twice.
-			yaml:        []byte("true: string-value-of-yes\ntrue: 1"),
-			wantErr:     `key true already set in map`,
-		},
-		{
-			// In YAML, `YES` is a Boolean true.
-			yaml: []byte("true: YES"),
-			want: UnmarshalString{True: "true"},
-		},
-	} {
-		s := UnmarshalString{}
-		err := UnmarshalStrict(tc.yaml, &s)
-		if tc.wantErr != "" && err == nil {
-			t.Errorf("UnmarshalStrict(%#q, &s) = nil; want error", string(tc.yaml))
-			continue
+	t.Run("UnmarshalStrict", func(t *testing.T) {
+		failTests := map[string]unmarshalTestCase{}
+		for name, test := range tests {
+			test.err = fatalErrorsType
+			failTests[name] = test
 		}
-		if tc.wantErr == "" && err != nil {
-			t.Errorf("UnmarshalStrict(%#q, &s) = %v; want no error", string(tc.yaml), err)
-			continue
-		}
-		// We only expect errors during unmarshalling YAML.
-		if want := "yaml: unmarshal errors"; tc.wantErr != "" && !strings.Contains(err.Error(), want) {
-			t.Errorf("UnmarshalStrict(%#q, &s) = %v; want err contains %#q", string(tc.yaml), err, want)
-		}
-		if tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr) {
-			t.Errorf("UnmarshalStrict(%#q, &s) = %v; want err contains %#q", string(tc.yaml), err, tc.wantErr)
-		}
-
-		// Even if there was an error, we continue the test: We expect that all
-		// errors occur during YAML unmarshalling. Such errors leaves `s` unmodified
-		// and the following check will compare default values of `UnmarshalString`.
-
-		if !reflect.DeepEqual(s, tc.want) {
-			t.Errorf("UnmarshalStrict(%#q, &s) = %+#v; want %+#v", string(tc.yaml), s, tc.want)
-		}
-	}
-}
-
-type Case struct {
-	input  string
-	output string
-	// By default we test that reversing the output == input. But if there is a
-	// difference in the reversed output, you can optionally specify it here.
-	reverse *string
-}
-
-type RunType int
-
-const (
-	RunTypeJSONToYAML RunType = iota
-	RunTypeYAMLToJSON
-)
-
-func TestJSONToYAML(t *testing.T) {
-	cases := []Case{
-		{
-			`{"t":"a"}`,
-			"t: a\n",
-			nil,
-		}, {
-			`{"t":null}`,
-			"t: null\n",
-			nil,
-		},
-	}
-
-	runCases(t, RunTypeJSONToYAML, cases)
+		testUnmarshal(t, funcUnmarshalStrict, failTests)
+	})
 }
 
 func TestYAMLToJSON(t *testing.T) {
-	cases := []Case{
-		{
-			"t: a\n",
-			`{"t":"a"}`,
-			nil,
-		}, {
-			"t: \n",
-			`{"t":null}`,
-			strPtr("t: null\n"),
-		}, {
-			"t: null\n",
-			`{"t":null}`,
-			nil,
-		}, {
-			"1: a\n",
-			`{"1":"a"}`,
-			strPtr("\"1\": a\n"),
-		}, {
-			"1000000000000000000000000000000000000: a\n",
-			`{"1e+36":"a"}`,
-			strPtr("\"1e+36\": a\n"),
-		}, {
-			"1e+36: a\n",
-			`{"1e+36":"a"}`,
-			strPtr("\"1e+36\": a\n"),
-		}, {
-			"\"1e+36\": a\n",
-			`{"1e+36":"a"}`,
-			nil,
-		}, {
-			"\"1.2\": a\n",
-			`{"1.2":"a"}`,
-			nil,
-		}, {
-			"- t: a\n",
-			`[{"t":"a"}]`,
-			nil,
-		}, {
-			"- t: a\n" +
-				"- t:\n" +
-				"    b: 1\n" +
-				"    c: 2\n",
-			`[{"t":"a"},{"t":{"b":1,"c":2}}]`,
-			nil,
-		}, {
-			`[{t: a}, {t: {b: 1, c: 2}}]`,
-			`[{"t":"a"},{"t":{"b":1,"c":2}}]`,
-			strPtr("- t: a\n" +
-				"- t:\n" +
-				"    b: 1\n" +
-				"    c: 2\n"),
-		}, {
-			"- t: \n",
-			`[{"t":null}]`,
-			strPtr("- t: null\n"),
-		}, {
-			"- t: null\n",
-			`[{"t":null}]`,
-			nil,
+	tests := map[string]yamlToJSONTestcase{
+		"string value": {
+			yaml: "t: a\n",
+			json: `{"t":"a"}`,
+		},
+		"null value": {
+			yaml: "t: null\n",
+			json: `{"t":null}`,
+		},
+		"boolean value": {
+			yaml:                 "t: True\n",
+			json:                 `{"t":true}`,
+			yamlReverseOverwrite: strPtr("t: true\n"),
+		},
+		"boolean value (no)": {
+			yaml:                 "t: no\n",
+			json:                 `{"t":false}`,
+			yamlReverseOverwrite: strPtr("t: false\n"),
+		},
+		"integer value (2^53 + 1)": {
+			yaml:                 "t: 9007199254740993\n",
+			json:                 `{"t":9007199254740993}`,
+			yamlReverseOverwrite: strPtr("t: 9007199254740993\n"),
+		},
+		"integer value (1000000000000000000000000000000000000)": {
+			yaml:                 "t: 1000000000000000000000000000000000000\n",
+			json:                 `{"t":1e+36}`,
+			yamlReverseOverwrite: strPtr("t: 1e+36\n"),
+		},
+		"line-wrapped string value": {
+			yaml: "t: this is very long line with spaces and it must be longer than 80 so we will repeat\n  that it must be longer that 80\n",
+			json: `{"t":"this is very long line with spaces and it must be longer than 80 so we will repeat that it must be longer that 80"}`,
+		},
+		"empty yaml value": {
+			yaml:                 "t: ",
+			json:                 `{"t":null}`,
+			yamlReverseOverwrite: strPtr("t: null\n"),
+		},
+		"boolean key": {
+			yaml:                 "True: a",
+			json:                 `{"true":"a"}`,
+			yamlReverseOverwrite: strPtr("\"true\": a\n"),
+		},
+		"boolean key (no)": {
+			yaml:                 "no: a",
+			json:                 `{"false":"a"}`,
+			yamlReverseOverwrite: strPtr("\"false\": a\n"),
+		},
+		"integer key": {
+			yaml:                 "1: a",
+			json:                 `{"1":"a"}`,
+			yamlReverseOverwrite: strPtr("\"1\": a\n"),
+		},
+		"float key": {
+			yaml:                 "1.2: a",
+			json:                 `{"1.2":"a"}`,
+			yamlReverseOverwrite: strPtr("\"1.2\": a\n"),
+		},
+		"large integer key": {
+			yaml:                 "1000000000000000000000000000000000000: a",
+			json:                 `{"1e+36":"a"}`,
+			yamlReverseOverwrite: strPtr("\"1e+36\": a\n"),
+		},
+		"large integer key (scientific notation)": {
+			yaml:                 "1e+36: a",
+			json:                 `{"1e+36":"a"}`,
+			yamlReverseOverwrite: strPtr("\"1e+36\": a\n"),
+		},
+		"string key (large integer as string)": {
+			yaml: "\"1e+36\": a\n",
+			json: `{"1e+36":"a"}`,
+		},
+		"string key (float as string)": {
+			yaml: "\"1.2\": a\n",
+			json: `{"1.2":"a"}`,
+		},
+		"array": {
+			yaml: "- t: a\n",
+			json: `[{"t":"a"}]`,
+		},
+		"nested struct array": {
+			yaml: "- t: a\n- t:\n    b: 1\n    c: 2\n",
+			json: `[{"t":"a"},{"t":{"b":1,"c":2}}]`,
+		},
+		"nested struct array (json notation)": {
+			yaml:                 `[{t: a}, {t: {b: 1, c: 2}}]`,
+			json:                 `[{"t":"a"},{"t":{"b":1,"c":2}}]`,
+			yamlReverseOverwrite: strPtr("- t: a\n- t:\n    b: 1\n    c: 2\n"),
+		},
+		"empty struct value": {
+			yaml:                 "- t: ",
+			json:                 `[{"t":null}]`,
+			yamlReverseOverwrite: strPtr("- t: null\n"),
+		},
+		"null struct value": {
+			yaml: "- t: null\n",
+			json: `[{"t":null}]`,
+		},
+		"binary data": {
+			yaml:                 "a: !!binary gIGC",
+			json:                 `{"a":"\ufffd\ufffd\ufffd"}`,
+			yamlReverseOverwrite: strPtr("a: \ufffd\ufffd\ufffd\n"),
+		},
+
+		// Cases that should produce errors.
+		"~ key": {
+			yaml:                 "~: a",
+			json:                 `{"null":"a"}`,
+			yamlReverseOverwrite: strPtr("\"null\": a\n"),
+			err:                  fatalErrorsType,
+		},
+		"null key": {
+			yaml:                 "null: a",
+			json:                 `{"null":"a"}`,
+			yamlReverseOverwrite: strPtr("\"null\": a\n"),
+			err:                  fatalErrorsType,
 		},
 	}
 
-	// Cases that should produce errors.
-	_ = []Case{
-		{
-			"~: a",
-			`{"null":"a"}`,
-			nil,
-		}, {
-			"a: !!binary gIGC\n",
-			"{\"a\":\"\x80\x81\x82\"}",
-			nil,
+	t.Run("YAMLToJSON", func(t *testing.T) {
+		testYAMLToJSON(t, funcYAMLToJSON, tests)
+	})
+
+	t.Run("YAMLToJSONStrict", func(t *testing.T) {
+		testYAMLToJSON(t, funcYAMLToJSONStrict, tests)
+	})
+}
+
+func TestYAMLToJSONStrictFails(t *testing.T) {
+	tests := map[string]yamlToJSONTestcase{
+		// expect YAMLtoJSON to pass on duplicate field names
+		"duplicate struct value": {
+			yaml:                 "foo: bar\nfoo: baz\n",
+			json:                 `{"foo":"baz"}`,
+			yamlReverseOverwrite: strPtr("foo: baz\n"),
 		},
 	}
 
-	runCases(t, RunTypeYAMLToJSON, cases)
+	t.Run("YAMLToJSON", func(t *testing.T) {
+		testYAMLToJSON(t, funcYAMLToJSON, tests)
+	})
+
+	t.Run("YAMLToJSONStrict", func(t *testing.T) {
+		failTests := map[string]yamlToJSONTestcase{}
+		for name, test := range tests {
+			test.err = fatalErrorsType
+			failTests[name] = test
+		}
+		testYAMLToJSON(t, funcYAMLToJSONStrict, failTests)
+	})
 }
 
-func runCases(t *testing.T, runType RunType, cases []Case) {
-	var f func([]byte) ([]byte, error)
-	var invF func([]byte) ([]byte, error)
-	var msg string
-	var invMsg string
-	if runType == RunTypeJSONToYAML {
-		f = JSONToYAML
-		invF = YAMLToJSON
-		msg = "JSON to YAML"
-		invMsg = "YAML back to JSON"
-	} else {
-		f = YAMLToJSON
-		invF = JSONToYAML
-		msg = "YAML to JSON"
-		invMsg = "JSON back to YAML"
+func TestJSONObjectToYAMLObject(t *testing.T) {
+	const bigUint64 = ((uint64(1) << 63) + 500) / 1000 * 1000
+	intOrInt64 := func(i64 int64) interface{} {
+		if i := int(i64); i64 == int64(i) {
+			return i
+		}
+		return i64
 	}
 
-	for _, c := range cases {
-		// Convert the string.
-		t.Logf("converting %s\n", c.input)
-		output, err := f([]byte(c.input))
-		if err != nil {
-			t.Errorf("Failed to convert %s, input: `%s`, err: %v", msg, c.input, err)
-		}
-
-		// Check it against the expected output.
-		if string(output) != c.output {
-			t.Errorf("Failed to convert %s, input: `%s`, expected `%s`, got `%s`",
-				msg, c.input, c.output, string(output))
-		}
-
-		// Set the string that we will compare the reversed output to.
-		reverse := c.input
-		// If a special reverse string was specified, use that instead.
-		if c.reverse != nil {
-			reverse = *c.reverse
-		}
-
-		// Reverse the output.
-		input, err := invF(output)
-		if err != nil {
-			t.Errorf("Failed to convert %s, input: `%s`, err: %v", invMsg, string(output), err)
-		}
-
-		// Check the reverse is equal to the input (or to *c.reverse).
-		if string(input) != reverse {
-			t.Errorf("Failed to convert %s, input: `%s`, expected `%s`, got `%s`",
-				invMsg, string(output), reverse, string(input))
-		}
+	tests := []struct {
+		name     string
+		input    map[string]interface{}
+		expected yamlv2.MapSlice
+	}{
+		{name: "nil", expected: yamlv2.MapSlice(nil)},
+		{name: "empty", input: map[string]interface{}{}, expected: yamlv2.MapSlice(nil)},
+		{
+			name: "values",
+			input: map[string]interface{}{
+				"nil slice":          []interface{}(nil),
+				"nil map":            map[string]interface{}(nil),
+				"empty slice":        []interface{}{},
+				"empty map":          map[string]interface{}{},
+				"bool":               true,
+				"float64":            float64(42.1),
+				"fractionless":       float64(42),
+				"int":                int(42),
+				"int64":              int64(42),
+				"int64 big":          float64(math.Pow(2, 62)),
+				"negative int64 big": -float64(math.Pow(2, 62)),
+				"map":                map[string]interface{}{"foo": "bar"},
+				"slice":              []interface{}{"foo", "bar"},
+				"string":             string("foo"),
+				"uint64 big":         bigUint64,
+			},
+			expected: yamlv2.MapSlice{
+				{Key: "nil slice"},
+				{Key: "nil map"},
+				{Key: "empty slice", Value: []interface{}{}},
+				{Key: "empty map", Value: yamlv2.MapSlice(nil)},
+				{Key: "bool", Value: true},
+				{Key: "float64", Value: float64(42.1)},
+				{Key: "fractionless", Value: int(42)},
+				{Key: "int", Value: int(42)},
+				{Key: "int64", Value: int(42)},
+				{Key: "int64 big", Value: intOrInt64(int64(1) << 62)},
+				{Key: "negative int64 big", Value: intOrInt64(-(1 << 62))},
+				{Key: "map", Value: yamlv2.MapSlice{{Key: "foo", Value: "bar"}}},
+				{Key: "slice", Value: []interface{}{"foo", "bar"}},
+				{Key: "string", Value: string("foo")},
+				{Key: "uint64 big", Value: bigUint64},
+			},
+		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := JSONObjectToYAMLObject(tt.input)
+			sortMapSlicesInPlace(tt.expected)
+			sortMapSlicesInPlace(got)
+			if !reflect.DeepEqual(tt.expected, got) {
+				t.Errorf("jsonToYAML() returned unexpected results (-want+got):\n%v", cmp.Diff(tt.expected, got))
+			}
 
+			jsonBytes, err := json.Marshal(tt.input)
+			if err != nil {
+				t.Fatalf("unexpected json.Marshal error: %v", err)
+			}
+			var gotByRoundtrip yamlv2.MapSlice
+			if err := yamlv2.Unmarshal(jsonBytes, &gotByRoundtrip); err != nil {
+				t.Fatalf("unexpected yaml.Unmarshal error: %v", err)
+			}
+
+			// yamlv2.Unmarshal loses precision, it's rounding to the 4th last digit.
+			// Replicate this here in the test, but don't change the type.
+			for i := range got {
+				switch got[i].Key {
+				case "int64 big", "uint64 big", "negative int64 big":
+					switch v := got[i].Value.(type) {
+					case int64:
+						d := int64(500)
+						if v < 0 {
+							d = -500
+						}
+						got[i].Value = int64((v+d)/1000) * 1000
+					case uint64:
+						got[i].Value = uint64((v+500)/1000) * 1000
+					case int:
+						d := int(500)
+						if v < 0 {
+							d = -500
+						}
+						got[i].Value = int((v+d)/1000) * 1000
+					default:
+						t.Fatalf("unexpected type for key %s: %v:%T", got[i].Key, v, v)
+					}
+				}
+			}
+
+			if !reflect.DeepEqual(got, gotByRoundtrip) {
+				t.Errorf("yaml.Unmarshal(json.Marshal(tt.input)) returned unexpected results (-want+got):\n%v", cmp.Diff(got, gotByRoundtrip))
+				t.Errorf("json: %s", string(jsonBytes))
+			}
+		})
+	}
 }
 
-// To be able to easily fill in the *Case.reverse string above.
-func strPtr(s string) *string {
-	return &s
+func sortMapSlicesInPlace(x interface{}) {
+	switch x := x.(type) {
+	case []interface{}:
+		for i := range x {
+			sortMapSlicesInPlace(x[i])
+		}
+	case yamlv2.MapSlice:
+		sort.Slice(x, func(a, b int) bool {
+			return x[a].Key.(string) < x[b].Key.(string)
+		})
+	}
 }
 
-func TestYAMLToJSONStrict(t *testing.T) {
-	const data = `
-foo: bar
-foo: baz
+func TestPatchedYamlV3AndUpstream(t *testing.T) {
+	input := `group: apps
+apiVersion: v1
+kind: Deployment
+metadata:
+  name: deploy1
+spec:
+  template:
+    spec:
+      containers:
+      - image: nginx:1.7.9
+        name: nginx-tagged
+      - image: nginx:latest
+        name: nginx-latest
+      - image: foobar:1
+        name: replaced-with-digest
+      - image: postgres:1.8.0
+        name: postgresdb
+      initContainers:
+      - image: nginx
+        name: nginx-notag
+      - image: nginx@sha256:111111111111111111
+        name: nginx-sha256
+      - image: alpine:1.8.0
+        name: init-alpine
 `
-	if _, err := YAMLToJSON([]byte(data)); err != nil {
-		t.Error("expected YAMLtoJSON to pass on duplicate field names")
+
+	var v3Map map[string]interface{}
+	var v2Map map[string]interface{}
+
+	// unmarshal the input into the two maps
+	if err := yamlv3.Unmarshal([]byte(input), &v3Map); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := YAMLToJSONStrict([]byte(data)); err == nil {
-		t.Error("expected YAMLtoJSONStrict to fail on duplicate field names")
+	if err := yamlv2.Unmarshal([]byte(input), &v2Map); err != nil {
+		t.Fatal(err)
 	}
+
+	// marshal using non-default settings from the yaml v3 fork
+	var buf bytes.Buffer
+	enc := yamlv3.NewEncoder(&buf)
+	enc.CompactSeqIndent()
+	enc.SetIndent(2)
+	err := enc.Encode(v3Map)
+	v3output := buf.String()
+
+	// marshal using the yaml v2 fork
+	v2output, err := yamlv2.Marshal(v2Map)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v3output != string(v2output) {
+		t.Fatalf("expected\n%s\ngot\n%s", string(v2output), v3output)
+	}
+}
+
+func TestUnmarshalWithTags(t *testing.T) {
+	type WithTaggedField struct {
+		Field string `json:"field"`
+	}
+
+	t.Run("Known tagged field", func(t *testing.T) {
+		y := []byte(`field: "hello"`)
+		v := WithTaggedField{}
+		if err := Unmarshal(y, &v, DisallowUnknownFields); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if v.Field != "hello" {
+			t.Errorf("v.Field=%v, want 'hello'", v.Field)
+		}
+
+	})
+	t.Run("With unknown tagged field", func(t *testing.T) {
+		y := []byte(`unknown: "hello"`)
+		v := WithTaggedField{}
+		err := Unmarshal(y, &v, DisallowUnknownFields)
+		if err == nil {
+			t.Errorf("want error because of unknown field, got <nil>: v=%#v", v)
+		}
+	})
+
+}
+
+func exampleUnknown() {
+	type WithTaggedField struct {
+		Field string `json:"field"`
+	}
+	y := []byte(`unknown: "hello"`)
+	v := WithTaggedField{}
+	fmt.Printf("%v\n", Unmarshal(y, &v, DisallowUnknownFields))
+	// Ouptut:
+	// unmarshaling JSON: while decoding JSON: json: unknown field "unknown"
 }

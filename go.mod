@@ -1,3 +1,8 @@
-module github.com/ghodss/yaml
+module go.khulnasoft.com/yaml
 
-require gopkg.in/yaml.v2 v2.2.2
+go 1.12
+
+require (
+	github.com/google/go-cmp v0.5.9
+	gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405
+)
